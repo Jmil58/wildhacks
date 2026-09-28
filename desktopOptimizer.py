@@ -5,6 +5,7 @@ import platform
 import socket
 import os
 import sys
+import stat as stat_module
 import glob
 import json
 import tempfile
@@ -55,6 +56,12 @@ HISTORY_FILE = os.path.join(CONFIG_DIR, "history.json")
 RECOVERY_DIR = os.path.join(CONFIG_DIR, "recovery")
 RECOVERY_INDEX_FILE = os.path.join(CONFIG_DIR, "recovery.json")
 RECOVERY_LOCK = threading.RLock()
+HISTORY_LOCK = threading.RLock()
+
+# Paths that have been moved into Recovery but whose index record hasn't been
+# written yet. reconcile_recovery_index() ignores these so it never creates
+# "Unknown" duplicates while a cleanup is still running.
+_PENDING_RECOVERY_PATHS = set()
 
 DEFAULT_CONFIG = {
     "min_age_minutes": 60,
@@ -70,12 +77,30 @@ def ensure_config_dir():
         pass
 
 
+def atomic_write_json(path, data, indent=2):
+    """Write to a temp file then swap it in, so a crash can't leave a
+    half-written (corrupt) JSON file behind."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=indent)
+    os.replace(tmp, path)
+
+
+def is_inside(path, parent):
+    try:
+        path = os.path.normcase(os.path.abspath(path))
+        parent = os.path.normcase(os.path.abspath(parent))
+        return path == parent or path.startswith(parent + os.sep)
+    except (ValueError, OSError):
+        return False
+
+
 def load_config():
     ensure_config_dir()
     config = dict(DEFAULT_CONFIG)
     if os.path.isfile(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, "r") as f:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
                 config.update(data)
@@ -87,8 +112,7 @@ def load_config():
 def save_config(config):
     ensure_config_dir()
     try:
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(config, f, indent=2)
+        atomic_write_json(CONFIG_FILE, config)
         return True
     except OSError:
         return False
@@ -98,7 +122,7 @@ def load_history():
     ensure_config_dir()
     if os.path.isfile(HISTORY_FILE):
         try:
-            with open(HISTORY_FILE, "r") as f:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list):
                 return data
@@ -110,17 +134,18 @@ def load_history():
 def save_history(history):
     ensure_config_dir()
     try:
-        with open(HISTORY_FILE, "w") as f:
-            json.dump(history, f, indent=2)
+        with HISTORY_LOCK:
+            atomic_write_json(HISTORY_FILE, history)
         return True
     except OSError:
         return False
 
 
 def append_history_record(record, max_records=200):
-    history = load_history()
-    history.insert(0, record)
-    save_history(history[:max_records])
+    with HISTORY_LOCK:
+        history = load_history()
+        history.insert(0, record)
+        save_history(history[:max_records])
 
 
 # =====================================================================
@@ -135,6 +160,7 @@ def ensure_recovery_dir():
     except OSError:
         return False
 
+
 def load_recovery_index():
     ensure_config_dir()
     if not os.path.isfile(RECOVERY_INDEX_FILE):
@@ -143,97 +169,178 @@ def load_recovery_index():
         with open(RECOVERY_INDEX_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, OSError):
+    except json.JSONDecodeError:
+        # Keep the damaged file for inspection instead of silently
+        # overwriting it with an empty list on the next save.
+        try:
+            os.replace(RECOVERY_INDEX_FILE, RECOVERY_INDEX_FILE + ".corrupt")
+        except OSError:
+            pass
         return []
+    except OSError:
+        return []
+
 
 def save_recovery_index(items):
     ensure_config_dir()
     try:
         with RECOVERY_LOCK:
-            with open(RECOVERY_INDEX_FILE, "w", encoding="utf-8") as f:
-                json.dump(items, f, indent=2)
+            atomic_write_json(RECOVERY_INDEX_FILE, items, indent=None)
         return True
     except OSError:
         return False
 
-def move_file_to_recovery(path):
+
+def has_valid_original(record):
+    """A record can only be restored if we know a real, absolute original path."""
+    p = record.get("original_path")
+    return bool(p) and isinstance(p, str) and os.path.isabs(p)
+
+
+def _move_to_recovery_raw(path):
+    """Move ONE file into Recovery without touching the index.
+    Returns (ok, record, error). The caller MUST later call
+    add_recovery_records([...]) (or rollback_moves) for every ok record."""
     if not os.path.isfile(path):
         return False, None, "File does not exist."
     if not ensure_recovery_dir():
         return False, None, "Could not create the Recovery folder."
+
+    original_path = os.path.abspath(path)
+    recovery_id = str(uuid.uuid4())
+    recovery_path = os.path.join(RECOVERY_DIR, recovery_id + "_" + os.path.basename(original_path))
+    abs_recovery = os.path.abspath(recovery_path)
+
+    with RECOVERY_LOCK:
+        _PENDING_RECOVERY_PATHS.add(abs_recovery)
     try:
-        size = os.path.getsize(path)
-        original_path = os.path.abspath(path)
-        recovery_id = str(uuid.uuid4())
-        recovery_path = os.path.join(RECOVERY_DIR, recovery_id + "_" + os.path.basename(original_path))
+        size = os.path.getsize(original_path)
         shutil.move(original_path, recovery_path)
-        record = {
-            "id": recovery_id, "name": os.path.basename(original_path),
-            "original_path": original_path, "recovery_path": recovery_path,
-            "size": size, "moved_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        with RECOVERY_LOCK:
-            items = load_recovery_index()
-            items.insert(0, record)
-            if not save_recovery_index(items):
-                try:
-                    os.makedirs(os.path.dirname(original_path), exist_ok=True)
-                    shutil.move(recovery_path, original_path)
-                except OSError:
-                    pass
-                return False, None, "Could not save the Recovery index."
-        return True, record, None
     except PermissionError as e:
-        return False, None, f"Permission denied: {e}"
+        with RECOVERY_LOCK:
+            _PENDING_RECOVERY_PATHS.discard(abs_recovery)
+        return False, None, f"Permission denied (or file in use): {e}"
     except OSError as e:
+        with RECOVERY_LOCK:
+            _PENDING_RECOVERY_PATHS.discard(abs_recovery)
         return False, None, str(e)
 
+    record = {
+        "id": recovery_id, "name": os.path.basename(original_path),
+        "original_path": original_path, "recovery_path": recovery_path,
+        "size": size, "moved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    return True, record, None
+
+
+def add_recovery_records(records):
+    """Write many records to the index in ONE load/save (under the lock)."""
+    if not records:
+        return True
+    with RECOVERY_LOCK:
+        items = load_recovery_index()
+        items = list(reversed(records)) + items
+        ok = save_recovery_index(items)
+        if ok:
+            for r in records:
+                _PENDING_RECOVERY_PATHS.discard(os.path.abspath(r["recovery_path"]))
+        return ok
+
+
+def rollback_moves(records):
+    """Put files back where they came from if the index couldn't be saved."""
+    for r in records:
+        try:
+            parent = os.path.dirname(r["original_path"])
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            shutil.move(r["recovery_path"], r["original_path"])
+        except OSError:
+            pass
+        with RECOVERY_LOCK:
+            _PENDING_RECOVERY_PATHS.discard(os.path.abspath(r["recovery_path"]))
+
+
+def move_file_to_recovery(path):
+    ok, record, error = _move_to_recovery_raw(path)
+    if not ok:
+        return False, None, error
+    if not add_recovery_records([record]):
+        rollback_moves([record])
+        return False, None, "Could not save the Recovery index."
+    return True, record, None
+
+
 def reconcile_recovery_index(items):
-    """Make sure every physical file in Recovery is represented in the index."""
+    """Make sure every physical file in Recovery is represented in the index.
+    Caller should hold RECOVERY_LOCK."""
     try:
         os.makedirs(RECOVERY_DIR, exist_ok=True)
         known_paths = {os.path.abspath(x.get("recovery_path")) for x in items if x.get("recovery_path")}
         changed = False
-        for entry in os.scandir(RECOVERY_DIR):
-            if not entry.is_file():
-                continue
-            path = os.path.abspath(entry.path)
-            if path in known_paths:
-                continue
-            try:
-                size = entry.stat().st_size
-                moved_at = datetime.fromtimestamp(entry.stat().st_mtime).isoformat(timespec="seconds")
-            except OSError:
-                continue
-            filename = entry.name
-            display_name = filename.split("_", 1)[1] if "_" in filename else filename
-            items.insert(0, {
-                "id": str(uuid.uuid4()),
-                "name": display_name,
-                "original_path": "Unknown (Recovery record was missing)",
-                "recovery_path": path,
-                "size": size,
-                "moved_at": moved_at,
-            })
-            changed = True
+        with os.scandir(RECOVERY_DIR) as it:
+            for entry in it:
+                if not entry.is_file():
+                    continue
+                path = os.path.abspath(entry.path)
+                if path in known_paths or path in _PENDING_RECOVERY_PATHS:
+                    continue
+                try:
+                    st = entry.stat()
+                    size = st.st_size
+                    moved_at = datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")
+                except OSError:
+                    continue
+                filename = entry.name
+                display_name = filename.split("_", 1)[1] if "_" in filename else filename
+                items.insert(0, {
+                    "id": str(uuid.uuid4()),
+                    "name": display_name,
+                    "original_path": "Unknown (Recovery record was missing)",
+                    "recovery_path": path,
+                    "size": size,
+                    "moved_at": moved_at,
+                })
+                changed = True
         if changed:
             save_recovery_index(items)
     except OSError:
         pass
     return items
 
-def remove_recovery_record(record_id):
+
+def load_reconciled_recovery():
+    """Load + reconcile + prune, all under the lock so it can't race a cleanup."""
     with RECOVERY_LOCK:
-        items = [x for x in load_recovery_index() if x.get("id") != record_id]
+        items = reconcile_recovery_index(load_recovery_index())
+        valid = [x for x in items
+                 if x.get("recovery_path") and os.path.isfile(x.get("recovery_path"))
+                 or os.path.abspath(x.get("recovery_path", "")) in _PENDING_RECOVERY_PATHS]
+        if len(valid) != len(items):
+            save_recovery_index(valid)
+        return valid
+
+
+def remove_recovery_records(record_ids):
+    ids = set(record_ids)
+    if not ids:
+        return True
+    with RECOVERY_LOCK:
+        items = [x for x in load_recovery_index() if x.get("id") not in ids]
         return save_recovery_index(items)
 
-def restore_recovery_item(record):
+
+def remove_recovery_record(record_id):
+    return remove_recovery_records([record_id])
+
+
+def restore_recovery_item(record, remove_record=True):
     src = record.get("recovery_path")
     dst = record.get("original_path")
     if not src or not os.path.isfile(src):
         return False, "The recovered file could not be found."
-    if not dst:
-        return False, "The original path is missing."
+    if not has_valid_original(record):
+        return False, "The original location for this file is unknown, so it can't be restored."
     if os.path.exists(dst):
         return False, "A file already exists at the original location:\n\n" + dst
     try:
@@ -241,20 +348,55 @@ def restore_recovery_item(record):
         if parent:
             os.makedirs(parent, exist_ok=True)
         shutil.move(src, dst)
-        remove_recovery_record(record.get("id"))
+        if remove_record:
+            remove_recovery_record(record.get("id"))
         return True, None
     except OSError as e:
         return False, str(e)
 
-def permanently_delete_recovery_item(record):
+
+def restore_recovery_items(records):
+    """Restore many files, updating the index once at the end."""
+    restored = 0
+    failed = 0
+    done_ids = []
+    for r in records:
+        ok, _ = restore_recovery_item(r, remove_record=False)
+        if ok:
+            restored += 1
+            done_ids.append(r.get("id"))
+        else:
+            failed += 1
+    remove_recovery_records(done_ids)
+    return restored, failed
+
+
+def permanently_delete_recovery_item(record, remove_record=True):
     path = record.get("recovery_path")
     try:
         if path and os.path.isfile(path):
             os.remove(path)
-        remove_recovery_record(record.get("id"))
+        if remove_record:
+            remove_recovery_record(record.get("id"))
         return True, None
     except OSError as e:
         return False, str(e)
+
+
+def permanently_delete_recovery_items(records):
+    deleted = 0
+    failed = 0
+    done_ids = []
+    for r in records:
+        ok, _ = permanently_delete_recovery_item(r, remove_record=False)
+        if ok:
+            deleted += 1
+            done_ids.append(r.get("id"))
+        else:
+            failed += 1
+    remove_recovery_records(done_ids)
+    return deleted, failed
+
 
 # =====================================================================
 # System metrics
@@ -264,13 +406,17 @@ def get_root_path():
     return os.path.abspath(os.sep)
 
 
+def get_root_label():
+    root = get_root_path()
+    stripped = root.rstrip("\\/")
+    return stripped or "/"
+
+
 def get_temp_dir():
     return tempfile.gettempdir()
 
 
 def get_cpu_usage():
-    # interval=None returns the delta since the last call instead of
-    # blocking the calling thread for `interval` seconds.
     return psutil.cpu_percent(interval=None)
 
 
@@ -343,12 +489,32 @@ def get_recommendations(cpu, memory, disk):
 
 
 # =====================================================================
+# Protected paths (never offered for deletion in Large File Finder)
+# =====================================================================
+
+def get_protected_roots():
+    roots = []
+    if platform.system() == "Windows":
+        for var in ("SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+            v = os.environ.get(var)
+            if v:
+                roots.append(v)
+    else:
+        roots = ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc", "/boot",
+                 "/System", "/Library", "/Applications", "/var/lib"]
+    return roots
+
+
+def is_protected_path(path):
+    return any(is_inside(path, r) for r in get_protected_roots())
+
+
+# =====================================================================
 # Drives
 # =====================================================================
 
 def get_all_drives():
-    """Usage info for every mounted/mapped drive on the system.
-    """
+    """Usage info for every mounted/mapped drive on the system."""
     drives = []
     try:
         partitions = psutil.disk_partitions(all=False)
@@ -382,20 +548,17 @@ def get_all_drives():
 
 
 def get_junk_folders_for_drive(mountpoint):
+    """Only well-known junk locations. Generic root folders named Temp/tmp are
+    deliberately NOT included, since on secondary drives those are often
+    user folders."""
     system = platform.system()
     if system == "Windows":
         candidates = [
-            os.path.join(mountpoint, "Temp"),
-            os.path.join(mountpoint, "TEMP"),
-            os.path.join(mountpoint, "tmp"),
             os.path.join(mountpoint, "Windows", "Temp"),
             os.path.join(mountpoint, "$RECYCLE.BIN"),
-            os.path.join(mountpoint, "RECYCLER"),
         ]
     else:
         candidates = [
-            os.path.join(mountpoint, "tmp"),
-            os.path.join(mountpoint, "temp"),
             os.path.join(mountpoint, ".Trash-1000"),
             os.path.join(mountpoint, ".Trashes"),
         ]
@@ -404,12 +567,16 @@ def get_junk_folders_for_drive(mountpoint):
 
 def get_drive_junk_paths_all():
     paths = []
+    system_temp = os.path.normcase(os.path.abspath(get_temp_dir()))
     for d in get_all_drives():
         if d.get("error"):
             continue
         for p in get_junk_folders_for_drive(d["mountpoint"]):
-            if os.path.basename(p).upper() not in ("$RECYCLE.BIN", "RECYCLER"):
-                paths.append(p)
+            if os.path.basename(p).upper() in ("$RECYCLE.BIN", "RECYCLER"):
+                continue  # handled by the Recycle Bin category
+            if os.path.normcase(os.path.abspath(p)) == system_temp:
+                continue  # already covered by System Temp Files
+            paths.append(p)
     return paths
 
 
@@ -471,7 +638,7 @@ def get_thumbnail_cache_paths():
 
 
 # =====================================================================
-# Cleanup categories (used by the Cleanup page's scan-then-clean flow)
+# Cleanup categories
 # =====================================================================
 
 CLEANUP_CATEGORIES = [
@@ -482,7 +649,7 @@ CLEANUP_CATEGORIES = [
     },
     {
         "id": "drive_junk", "label": "Other Drives' Temp Folders",
-        "description": "Temp folders found on other local/mapped drives.",
+        "description": "Known temp/trash folders found on other local/mapped drives.",
         "paths_func": get_drive_junk_paths_all,
     },
     {
@@ -513,14 +680,12 @@ CLEANUP_CATEGORIES = [
 # =====================================================================
 
 def new_clean_result():
-    """Shape shared by clean_folder / clean_category / clean_drive_junk,
-    so the GUI layer only ever deals with one consistent dict."""
     return {
-        "deleted_bytes": 0,
-        "skipped_recent": 0,
-        "skipped_permission": 0,
-        "deleted_paths": [],      # list of (path, size) actually removed
-        "permission_paths": [],   # list of paths that need admin rights
+        "deleted_bytes": 0,      # bytes moved into Recovery
+        "skipped_recent": 0,     # too recent / in use / other failure
+        "skipped_permission": 0, # permission denied (may also mean file in use)
+        "deleted_paths": [],     # list of (path, size) moved to Recovery
+        "permission_paths": [],  # list of paths that were denied
     }
 
 
@@ -533,25 +698,50 @@ def merge_clean_result(into, other):
     return into
 
 
+FLUSH_EVERY = 200
+
+
 def clean_folder(folder, min_age_seconds=3600):
-    """Move cleanable files into PC Optimizer Recovery instead of deleting them."""
+    """Move cleanable files into PC Optimizer Recovery (not a real delete).
+    The Recovery index is written in batches instead of once per file."""
     result = new_clean_result()
     if not folder or not os.path.isdir(folder):
         return result
+    if is_inside(folder, CONFIG_DIR):
+        return result
+
     now = time.time()
+    pending = []
+
+    def flush():
+        nonlocal pending
+        if not pending:
+            return
+        batch = pending
+        pending = []
+        if add_recovery_records(batch):
+            for rec in batch:
+                result["deleted_bytes"] += rec["size"]
+                result["deleted_paths"].append((rec["original_path"], rec["size"]))
+        else:
+            rollback_moves(batch)
+            result["skipped_recent"] += len(batch)
+
     for root, dirs, files in os.walk(folder, topdown=False):
+        if is_inside(root, CONFIG_DIR):
+            continue
         for file in files:
             path = os.path.join(root, file)
             try:
-                stat = os.stat(path)
-                if now - stat.st_mtime < min_age_seconds:
+                st = os.stat(path)
+                if now - st.st_mtime < min_age_seconds:
                     result["skipped_recent"] += 1
                     continue
-                size = stat.st_size
-                success, record, error = move_file_to_recovery(path)
+                success, record, error = _move_to_recovery_raw(path)
                 if success:
-                    result["deleted_bytes"] += size
-                    result["deleted_paths"].append((path, size))
+                    pending.append(record)
+                    if len(pending) >= FLUSH_EVERY:
+                        flush()
                 elif error and ("permission" in error.lower() or "access" in error.lower()):
                     result["skipped_permission"] += 1
                     result["permission_paths"].append(path)
@@ -562,11 +752,14 @@ def clean_folder(folder, min_age_seconds=3600):
                 result["permission_paths"].append(path)
             except (FileNotFoundError, OSError):
                 result["skipped_recent"] += 1
+    flush()
     return result
 
+
 def scan_folder_cleanable(folder, min_age_seconds):
-    """Compute how much a clean_folder() call WOULD free, without deleting."""
     if not folder or not os.path.isdir(folder):
+        return 0, 0
+    if is_inside(folder, CONFIG_DIR):
         return 0, 0
 
     total = 0
@@ -574,6 +767,8 @@ def scan_folder_cleanable(folder, min_age_seconds):
     now = time.time()
 
     for root, dirs, files in os.walk(folder):
+        if is_inside(root, CONFIG_DIR):
+            continue
         for f in files:
             path = os.path.join(root, f)
             try:
@@ -615,17 +810,13 @@ def clean_drive_junk(mountpoint, min_age_seconds=3600):
 
 
 # =====================================================================
-# Cleanup reports (the "what actually got deleted" .txt log)
+# Cleanup reports
 # =====================================================================
 
 REPORTS_DIR = os.path.join(CONFIG_DIR, "reports")
 
 
 def write_cleanup_report(deleted_paths, permission_paths, skipped_recent, freed_bytes, categories):
-    """Write a plain-text report listing every file that was deleted
-    (and every one that was blocked by permissions) in one cleanup run.
-    Returns the report's file path, or None if it couldn't be written.
-    """
     try:
         os.makedirs(REPORTS_DIR, exist_ok=True)
     except OSError:
@@ -639,13 +830,14 @@ def write_cleanup_report(deleted_paths, permission_paths, skipped_recent, freed_
         "PC Optimizer -- Cleanup Report",
         f"Date: {timestamp.strftime('%b %d, %Y at %I:%M %p')}",
         f"Categories cleaned: {', '.join(categories) if categories else 'N/A'}",
-        f"Total space freed: {format_bytes(freed_bytes)}",
-        f"Files deleted: {len(deleted_paths)}",
-        f"Files skipped (in use / too recent): {skipped_recent}",
-        f"Files skipped (need administrator rights): {len(permission_paths)}",
+        f"Total moved to Recovery: {format_bytes(freed_bytes)}",
+        "(Disk space is only reclaimed once Recovery is emptied.)",
+        f"Files moved to Recovery: {len(deleted_paths)}",
+        f"Files skipped (too recent / other): {skipped_recent}",
+        f"Files skipped (permission denied or in use): {len(permission_paths)}",
         "",
         "=" * 70,
-        f"DELETED FILES ({len(deleted_paths)})",
+        f"MOVED TO RECOVERY ({len(deleted_paths)})",
         "=" * 70,
     ]
     for path, size in deleted_paths:
@@ -654,7 +846,7 @@ def write_cleanup_report(deleted_paths, permission_paths, skipped_recent, freed_
     if permission_paths:
         lines.append("")
         lines.append("=" * 70)
-        lines.append(f"SKIPPED -- NEED ADMINISTRATOR RIGHTS ({len(permission_paths)})")
+        lines.append(f"SKIPPED -- PERMISSION DENIED OR IN USE ({len(permission_paths)})")
         lines.append("=" * 70)
         lines.extend(permission_paths)
 
@@ -671,7 +863,6 @@ def write_cleanup_report(deleted_paths, permission_paths, skipped_recent, freed_
 # =====================================================================
 
 def analyze_top_level(path, max_items=25):
-    """Size of each immediate child of `path` (folders sized recursively)."""
     entries = []
     try:
         with os.scandir(path) as it:
@@ -696,23 +887,47 @@ def analyze_top_level(path, max_items=25):
 # Large file finder
 # =====================================================================
 
-def find_large_files(root_path, min_size_bytes, max_results=100):
+POSIX_SKIP_DIRS = ("/proc", "/sys", "/dev", "/run")
+
+
+def find_large_files(root_path, min_size_bytes, max_results=100, cancel_event=None):
     results = []
+    is_windows = platform.system() == "Windows"
+
     for dirpath, dirnames, filenames in os.walk(root_path, onerror=lambda e: None):
+        if cancel_event is not None and cancel_event.is_set():
+            break
+
+        # Prune virtual filesystems, symlinked dirs, and our own data folder.
+        kept = []
+        for d in dirnames:
+            full = os.path.join(dirpath, d)
+            if not is_windows and full in POSIX_SKIP_DIRS:
+                continue
+            if os.path.islink(full):
+                continue
+            if is_inside(full, CONFIG_DIR):
+                continue
+            kept.append(d)
+        dirnames[:] = kept
+
         for f in filenames:
             path = os.path.join(dirpath, f)
             try:
-                size = os.path.getsize(path)
-                if size >= min_size_bytes:
-                    results.append((path, size))
+                st = os.lstat(path)
+                if not stat_module.S_ISREG(st.st_mode):
+                    continue
+                if st.st_size >= min_size_bytes:
+                    results.append((path, st.st_size))
             except OSError:
                 continue
+
     results.sort(key=lambda x: x[1], reverse=True)
     return results[:max_results]
 
 
 # =====================================================================
-# Startup apps (Windows only -- guarded elsewhere on other OSes)
+# Startup apps (Windows only)
 # =====================================================================
 
 STARTUP_REG_LOCATIONS = [
@@ -740,7 +955,7 @@ def get_startup_items():
                         i += 1
                     except OSError:
                         break
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
             continue
 
     appdata = os.environ.get("APPDATA")
@@ -757,7 +972,6 @@ def get_startup_items():
 
 
 def remove_startup_item(item):
-    """Best-effort removal: delete the registry value, or the shortcut file."""
     if item["location"] == "Startup Folder":
         try:
             os.remove(item["command"])
@@ -774,8 +988,7 @@ def remove_startup_item(item):
 
 
 # =====================================================================
-# Process list helper (keeps a persistent Process cache so cpu_percent
-# deltas are meaningful across refreshes)
+# Process list helper
 # =====================================================================
 
 def refresh_process_rows(proc_cache, limit=60):
@@ -786,7 +999,7 @@ def refresh_process_rows(proc_cache, limit=60):
         current_pids.add(pid)
         if pid not in proc_cache:
             try:
-                p.cpu_percent(None)  # prime; first read is always 0.0
+                p.cpu_percent(None)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
             proc_cache[pid] = p
@@ -827,24 +1040,28 @@ class PCOptimizer:
 
         self.nav_buttons = {}
         self._proc_cache = {}
+        self._after_ids = {}
 
         self._drives_request_id = 0
+        self._loading_active = False
+        self._loading_dots = 0
 
-    # Thread-safe queue used to send completed background work
-    # back to Tkinter's main thread.
+        # Busy flags (reset whenever the page changes or a job fails)
+        self._dashboard_tick_pending = False
+        self._processes_tick_pending = False
+        self._cleanup_running = False
+        self._storage_running = False
+        self._largefile_running = False
+        self._drive_clean_running = False
+        self._recovery_busy = False
+        self._largefile_cancel = None
+
+        # Thread-safe queue that hands finished background work back to Tk.
         self._gui_queue = queue.Queue()
-
-# Start checking the queue from the Tkinter thread.
         self.root.after(50, self.process_gui_queue)
 
         self._setup_ttk_style()
 
-        # Safety net: any exception raised inside a Tk callback (button
-        # clicks, after() timers, etc.) normally either prints a bare
-        # traceback to the console or silently kills a scheduled repeat
-        # (e.g. the dashboard/process auto-refresh loop just stops).
-        # Both look like "the app crashed" to a user. Route these
-        # through a visible, recoverable error dialog instead.
         self.root.report_callback_exception = self.handle_tk_exception
 
         self.create_sidebar()
@@ -862,7 +1079,7 @@ class PCOptimizer:
                 "You can keep using the app -- try refreshing this page."
             )
         except tk.TclError:
-            pass  # if even the error dialog can't show, don't crash on that too
+            pass
 
     def _setup_ttk_style(self):
         style = ttk.Style()
@@ -885,19 +1102,42 @@ class PCOptimizer:
         style.configure("TCombobox", fieldbackground=COLOR_CARD, background=COLOR_CARD)
 
     # -------------------------
+    # Scheduling helpers (prevent stacked refresh loops)
+    # -------------------------
+
+    def schedule(self, name, ms, fn):
+        self.cancel_schedule(name)
+        try:
+            self._after_ids[name] = self.root.after(ms, fn)
+        except tk.TclError:
+            pass
+
+    def cancel_schedule(self, name):
+        after_id = self._after_ids.pop(name, None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except (tk.TclError, ValueError):
+                pass
+
+    def cancel_all_schedules(self):
+        for name in list(self._after_ids.keys()):
+            self.cancel_schedule(name)
+
+    # -------------------------
     # Small UI helpers
     # -------------------------
 
     def add_hover(self, widget, normal_bg, hover_bg):
-        widget.bind("<Enter>", lambda e: widget.config(bg=hover_bg))
+        widget.bind("<Enter>", lambda e: widget.config(bg=hover_bg) if str(widget.cget("state")) != "disabled" else None)
         widget.bind("<Leave>", lambda e: widget.config(bg=normal_bg))
 
     def make_button(self, parent, text, command, bg=COLOR_ACCENT, hover=COLOR_ACCENT_HOVER,
-                     font=("Segoe UI", 10, "bold"), padx=18, pady=10):
+                    font=("Segoe UI", 10, "bold"), padx=18, pady=10):
         btn = tk.Button(
             parent, text=text, command=command, font=font, fg="white",
             bg=bg, activebackground=hover, bd=0, padx=padx, pady=pady,
-            cursor="hand2"
+            cursor="hand2", disabledforeground="#cbd5e1"
         )
         self.add_hover(btn, bg, hover)
         return btn
@@ -907,13 +1147,13 @@ class PCOptimizer:
         self._loading_dots = 0
 
         def step():
-            if not getattr(self, "_loading_active", False):
+            if not self._loading_active:
                 return
             try:
                 dots = "." * (self._loading_dots % 4)
                 label_widget.config(text=f"{base_text}{dots}")
             except tk.TclError:
-                return  # widget was destroyed (page changed)
+                return
             self._loading_dots += 1
             self.root.after(400, step)
 
@@ -923,9 +1163,6 @@ class PCOptimizer:
         self._loading_active = False
 
     def show_text_viewer(self, title, content):
-        """A simple in-app, read-only window for showing report text --
-        no dependency on the OS having a text editor associated, unlike
-        os.startfile()/subprocess-based "open externally" approaches."""
         try:
             win = tk.Toplevel(self.root)
         except tk.TclError:
@@ -968,32 +1205,27 @@ class PCOptimizer:
             return
         self.show_text_viewer(f"Cleanup Report -- {os.path.basename(report_path)}", content)
 
+    # -------------------------
+    # Background work
+    # -------------------------
+
     def process_gui_queue(self):
-        """Process a small batch of completed jobs so navigation stays responsive."""
-        max_callbacks = 4
+        """Deliver a small batch of finished jobs to the Tk main thread."""
+        max_callbacks = 10
         processed = 0
 
         while processed < max_callbacks:
             try:
-                item = self._gui_queue.get_nowait()
+                callback, payload = self._gui_queue.get_nowait()
             except queue.Empty:
                 break
 
-            # Older versions of the queue stored a page-generation value.
-            # Keep accepting that format, but do not silently discard the
-            # result here: some jobs (cleanup, indexing, etc.) must finish
-            # even if the user navigates to another page.
-            if len(item) == 3:
-                callback, result, _job_generation = item
-            else:
-                callback, result = item
-
             try:
-                callback(result)
+                callback(payload)
             except tk.TclError:
                 pass
-            except Exception as e:
-                print("GUI callback error:", e)
+            except Exception:
+                self.handle_tk_exception(*sys.exc_info())
             processed += 1
 
         try:
@@ -1001,55 +1233,45 @@ class PCOptimizer:
         except tk.TclError:
             pass
 
+    def make_error_handler(self, reset=None, title="Background Task Failed"):
+        """Build an on_error callback that resets busy flags/buttons and
+        shows the error, so a failed job can never leave the UI stuck."""
+        def handler(exc):
+            self.stop_loading()
+            try:
+                if reset:
+                    reset()
+            except tk.TclError:
+                pass
+            try:
+                messagebox.showerror(title, f"{exc}")
+            except tk.TclError:
+                pass
+        return handler
 
-    def run_background(self, work_fn, on_done):
+    def run_background(self, work_fn, on_done, on_error=None):
         """
-        Run work_fn() (no args) in a background thread and deliver its
-        return value to on_done(result) safely on the Tk main thread.
-
-        work_fn must NEVER touch any Tkinter object -- it should only
-        compute and return plain data. on_done is what's allowed to
-        touch widgets, and it always runs via process_gui_queue() on
-        the main thread, never directly from the worker thread.
+        Run work_fn() in a worker thread. On success on_done(result) is called
+        on the Tk thread; if work_fn raises, on_error(exception) is called
+        instead. work_fn must never touch Tk widgets.
         """
-        job_generation = self._page_generation
+        if on_error is None:
+            on_error = self.make_error_handler()
 
         def worker():
             try:
                 result = work_fn()
             except Exception as e:
                 print("Background worker error:", e)
-                result = e
-            self._gui_queue.put((on_done, result, job_generation))
+                self._gui_queue.put((on_error, e))
+                return
+            self._gui_queue.put((on_done, result))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def fetch_drives_async(self, callback):
-        """
-        Fetch drive information in a background thread.
+        self.run_background(get_all_drives, callback, on_error=lambda e: callback([]))
 
-        The worker does not call Tkinter. When the operation finishes,
-        the result is placed into _gui_queue. process_gui_queue()
-        delivers it from Tkinter's main thread.
-        """
-
-        job_generation = self._page_generation
-
-        def worker():
-            try:
-                drives = get_all_drives()
-            except Exception as e:
-                print("Drive detection error:", e)
-                drives = []
-
-            self._gui_queue.put(
-                (callback, drives, job_generation)
-            )
-
-        threading.Thread(
-            target=worker,
-            daemon=True
-        ).start()
     # -------------------------
     # Sidebar
     # -------------------------
@@ -1109,21 +1331,28 @@ class PCOptimizer:
 
     def clear_main(self):
         self.stop_loading()
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            try:
+                self.root.unbind_all(seq)
+            except tk.TclError:
+                pass
         for widget in self.main.winfo_children():
             widget.destroy()
 
     def set_page(self, key):
-        # Every navigation creates a new page generation.
-        #
-        # Background tasks capture this number when they start.
-        # If the number changes before they finish, we know their
-        # page was destroyed and their result must be ignored.
-            self._page_generation += 1
+        # New page generation: any in-flight refresh belonging to the old
+        # page will see the mismatch and drop its result.
+        self._page_generation += 1
+        self._active_page = key
 
-            self._active_page = key
+        # Kill old refresh loops so they can't stack, and clear busy flags
+        # that belonged to the old page's refresh loops.
+        self.cancel_all_schedules()
+        self._dashboard_tick_pending = False
+        self._processes_tick_pending = False
 
-            self.update_nav_highlight()
-            self.clear_main()
+        self.update_nav_highlight()
+        self.clear_main()
 
     def create_header(self, title):
         header = tk.Frame(self.main, bg=COLOR_BG)
@@ -1135,7 +1364,8 @@ class PCOptimizer:
         return header
 
     def make_scrollable(self, parent):
-        """Returns (outer_container_already_packed, inner_frame_to_fill)."""
+        """Returns the inner frame to fill. The inner frame always matches the
+        canvas width, and the mouse wheel scrolls it."""
         container = tk.Frame(parent, bg=COLOR_BG)
         container.pack(fill="both", expand=True, padx=35, pady=(0, 20))
 
@@ -1143,36 +1373,50 @@ class PCOptimizer:
         scrollbar = tk.Scrollbar(container, orient="vertical", command=canvas.yview)
         inner = tk.Frame(canvas, bg=COLOR_BG)
 
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window_id, width=e.width))
         canvas.configure(yscrollcommand=scrollbar.set)
 
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
+        def on_wheel(event):
+            try:
+                if event.num == 4:
+                    canvas.yview_scroll(-3, "units")
+                elif event.num == 5:
+                    canvas.yview_scroll(3, "units")
+                elif platform.system() == "Darwin":
+                    canvas.yview_scroll(int(-event.delta), "units")
+                else:
+                    canvas.yview_scroll(int(-event.delta / 120) * 3, "units")
+            except tk.TclError:
+                pass
+
+        # Removed again in clear_main() when the page changes.
+        self.root.bind_all("<MouseWheel>", on_wheel)
+        self.root.bind_all("<Button-4>", on_wheel)
+        self.root.bind_all("<Button-5>", on_wheel)
+
         return inner
 
     # =====================================================================
-    # 1) Dashboard (with live CPU / RAM graphs)
+    # 1) Dashboard
     # =====================================================================
 
     def navigate_dashboard(self):
         self.set_page("dashboard")
         self.create_header("System Dashboard")
 
-        # Metrics are filled in by the first tick_dashboard() call below,
-        # which fetches them on a background thread. We don't call
-        # get_cpu_usage()/get_memory_usage()/get_disk_usage() here on the
-        # main thread, since disk_usage() in particular can occasionally
-        # stall (a slow/removable/network drive) and freeze the whole UI
-        # right as the page opens.
         cards = tk.Frame(self.main, bg=COLOR_BG)
         cards.pack(fill="x", padx=35)
 
         self.dash_labels = {}
         self.dash_labels["cpu"] = self.create_metric_card(cards, "CPU", "…", 0)
         self.dash_labels["memory"] = self.create_metric_card(cards, "Memory", "…", 1)
-        self.dash_labels["disk"] = self.create_metric_card(cards, "Disk (C:)", "…", 2)
+        self.dash_labels["disk"] = self.create_metric_card(cards, f"Disk ({get_root_label()})", "…", 2)
         self.dash_labels["health"] = self.create_metric_card(cards, "Health", "…", 3)
 
         graphs = tk.Frame(self.main, bg=COLOR_BG)
@@ -1202,7 +1446,7 @@ class PCOptimizer:
 
     def create_metric_card(self, parent, title, value, column):
         card = tk.Frame(parent, bg=COLOR_CARD, width=150, height=110,
-                         highlightbackground=COLOR_BORDER, highlightthickness=1)
+                        highlightbackground=COLOR_BORDER, highlightthickness=1)
         card.grid(row=0, column=column, padx=8, sticky="nsew")
         card.grid_propagate(False)
         parent.columnconfigure(column, weight=1)
@@ -1261,37 +1505,26 @@ class PCOptimizer:
             ).pack(anchor="w", pady=4)
 
     def tick_dashboard(self):
-        # Self-terminating: once the user navigates away, _active_page
-        # changes and this loop simply stops rescheduling itself.
         if self._active_page != "dashboard":
             return
 
-        # Don't stack up a second fetch if the previous one hasn't
-        # returned yet (e.g. disk_usage() stalling on a slow/removable/
-        # network drive). We still reschedule below so the loop keeps
-        # trying on the normal cadence once it's free again.
-        if getattr(self, "_dashboard_tick_pending", False):
-            self.root.after(int(self.config["refresh_interval_sec"] * 1000), self.tick_dashboard)
+        generation = self._page_generation
+        interval = int(self.config["refresh_interval_sec"] * 1000)
+
+        if self._dashboard_tick_pending:
+            self.schedule("dashboard", interval, self.tick_dashboard)
             return
         self._dashboard_tick_pending = True
 
         def collect_metrics():
-            # Runs on a background thread. psutil calls here -- especially
-            # disk_usage() -- can occasionally block for a while (a sleepy
-            # USB/optical drive, a network share that's gone away, etc.).
-            # Never touch Tk widgets in here.
-            cpu = get_cpu_usage()
-            memory = get_memory_usage()
-            disk = get_disk_usage()
-            return (cpu, memory, disk)
+            return (get_cpu_usage(), get_memory_usage(), get_disk_usage())
 
         def apply_metrics(result):
+            if generation != self._page_generation:
+                return  # this result belongs to a page that no longer exists
             self._dashboard_tick_pending = False
-            if self._active_page != "dashboard":
-                return  # navigated away while the fetch was in flight
 
             cpu, memory, disk = result
-
             try:
                 self.dash_labels["cpu"].config(text=f"{cpu:.0f}%")
                 self.dash_labels["memory"].config(text=f"{memory:.0f}%")
@@ -1305,11 +1538,18 @@ class PCOptimizer:
 
                 self.render_recommendations(get_recommendations(cpu, memory, disk))
             except tk.TclError:
-                pass  # dashboard widgets were torn down mid-update; harmless
+                pass
 
-            self.root.after(int(self.config["refresh_interval_sec"] * 1000), self.tick_dashboard)
+            self.schedule("dashboard", interval, self.tick_dashboard)
 
-        self.run_background(collect_metrics, apply_metrics)
+        def failed(exc):
+            # Keep the refresh loop alive even if one reading fails.
+            if generation != self._page_generation:
+                return
+            self._dashboard_tick_pending = False
+            self.schedule("dashboard", interval, self.tick_dashboard)
+
+        self.run_background(collect_metrics, apply_metrics, on_error=failed)
 
     # =====================================================================
     # 2) Diagnostics
@@ -1317,16 +1557,12 @@ class PCOptimizer:
 
     def navigate_diagnostics(self):
         self.set_page("diagnostics")
+        generation = self._page_generation
         self.create_header("System Diagnostics")
 
         frame = tk.Frame(self.main, bg=COLOR_CARD, highlightbackground=COLOR_BORDER, highlightthickness=1)
         frame.pack(fill="both", expand=True, padx=35, pady=10)
 
-        # Every one of these checks (disk_usage especially, and the
-        # network socket for connectivity) can occasionally stall for a
-        # noticeable moment, so none of them run on the main thread --
-        # all four are fetched together in one background call and the
-        # rows are filled in once that's done.
         row_names = ["CPU Usage", "Memory Usage", "Disk Space", "Internet Connection"]
         rows = [self.create_diagnostic_row(frame, name, None, checking=True) for name in row_names]
 
@@ -1339,16 +1575,26 @@ class PCOptimizer:
             ]
 
         def finished(results):
-            if self._active_page != "diagnostics":
+            if generation != self._page_generation:
                 return
             try:
                 for (symbol_label, text_label), name, ok in zip(rows, row_names, results):
                     symbol_label.config(text="✓" if ok else "⚠", fg=COLOR_SUCCESS if ok else COLOR_WARNING)
                     text_label.config(text=name)
             except tk.TclError:
-                pass  # diagnostics page was closed mid-check; harmless
+                pass
 
-        self.run_background(collect_checks, finished)
+        def failed(exc):
+            if generation != self._page_generation:
+                return
+            try:
+                for symbol_label, text_label in rows:
+                    symbol_label.config(text="⚠", fg=COLOR_WARNING)
+                    text_label.config(text=text_label.cget("text").replace(" (checking...)", " (check failed)"))
+            except tk.TclError:
+                pass
+
+        self.run_background(collect_checks, finished, on_error=failed)
 
     def create_diagnostic_row(self, parent, name, status, checking=False):
         if checking:
@@ -1367,9 +1613,6 @@ class PCOptimizer:
         return symbol_label, text_label
 
     def check_internet(self):
-        # Runs on a background thread via run_background -- never call
-        # this directly from the main thread, the socket connect below
-        # can block for up to 2 seconds.
         try:
             with socket.create_connection(("8.8.8.8", 53), timeout=2):
                 return True
@@ -1388,19 +1631,10 @@ class PCOptimizer:
 
         list_frame = self.make_scrollable(self.main)
         loading_label = tk.Label(list_frame, text="", font=("Segoe UI", 11, "italic"),
-                                   fg=COLOR_MUTED, bg=COLOR_BG)
+                                 fg=COLOR_MUTED, bg=COLOR_BG)
         loading_label.pack(anchor="w", pady=20)
         self.start_loading(loading_label, "Loading drives")
 
-        # Tag this specific navigate_drives() call with a request id, and
-        # disable Refresh until it resolves. If the user re-opens this
-        # page (or hits Refresh again) before this fetch returns, the
-        # widgets above get destroyed by the NEXT navigate_drives() call.
-        # Without this guard, this call's stale callback would still try
-        # to draw into a destroyed list_frame and throw an uncaught Tk
-        # error. Checking the request id (not just the page name) lets
-        # us tell "still on Drives" apart from "still on Drives, but a
-        # newer instance of it".
         self._drives_request_id += 1
         my_request_id = self._drives_request_id
         try:
@@ -1409,35 +1643,32 @@ class PCOptimizer:
             pass
 
         def on_drives(drives):
-            self.stop_loading()
             if self._active_page != "drives" or my_request_id != self._drives_request_id:
-                return  # navigated away, or a newer Drives fetch superseded this one
+                return
+            self.stop_loading()
 
             try:
                 refresh_btn.config(state="normal")
             except tk.TclError:
-                pass  # button belongs to a page that's already gone; harmless
+                pass
 
             try:
                 for widget in list_frame.winfo_children():
                     widget.destroy()
             except tk.TclError:
-                return  # list_frame itself is already gone; nothing to draw into
+                return
 
             if not drives:
                 tk.Label(list_frame, text="No drives could be detected.", font=("Segoe UI", 12),
-                          fg="#d1d5db", bg=COLOR_BG).pack(anchor="w", pady=20)
+                         fg="#d1d5db", bg=COLOR_BG).pack(anchor="w", pady=20)
                 return
 
             for drive in drives:
                 try:
                     self.create_drive_card(list_frame, drive)
                 except Exception as e:
-                    # One malformed/unusual drive entry shouldn't take
-                    # down the whole page -- show it as an error row and
-                    # keep rendering the rest.
                     error_row = tk.Frame(list_frame, bg=COLOR_CARD,
-                                          highlightbackground=COLOR_DANGER, highlightthickness=1)
+                                         highlightbackground=COLOR_DANGER, highlightthickness=1)
                     error_row.pack(fill="x", pady=4, ipady=8)
                     tk.Label(
                         error_row, text=f"Couldn't display {drive.get('mountpoint', 'a drive')}: {e}",
@@ -1513,14 +1744,15 @@ class PCOptimizer:
             ).pack(side="left")
 
     def clean_drive(self, mountpoint, button):
-        if getattr(self, "_drive_clean_running", False):
+        if self._drive_clean_running:
             return
 
         junk_folders = get_junk_folders_for_drive(mountpoint)
         folder_list = "\n".join(junk_folders) if junk_folders else "(none found)"
         confirmed = messagebox.askyesno(
             "Confirm Cleanup",
-            f"This will move files older than 1 hour into PC Optimizer Recovery from:\n\n{folder_list}\n\nContinue?"
+            f"This will move files older than 1 hour into PC Optimizer Recovery from:\n\n{folder_list}\n\n"
+            "Disk space is only reclaimed once you empty Recovery.\n\nContinue?"
         )
         if not confirmed:
             return
@@ -1529,8 +1761,8 @@ class PCOptimizer:
         if button is not None:
             button.config(state="disabled")
 
-        def finished(result):
-            self._drive_clean_running = False
+        def do_clean():
+            result = clean_drive_junk(mountpoint)
             category_label = f"Drive junk ({mountpoint})"
             report_path = write_cleanup_report(
                 result["deleted_paths"], result["permission_paths"],
@@ -1543,26 +1775,37 @@ class PCOptimizer:
                 "categories": [category_label],
                 "report_path": report_path,
             })
+            return result, report_path
+
+        def finished(payload):
+            result, report_path = payload
+            self._drive_clean_running = False
             permission_line = (
-                f"\nSkipped (need administrator rights): {result['skipped_permission']}"
+                f"\nSkipped (permission denied or in use): {result['skipped_permission']}"
                 if result["skipped_permission"] else ""
             )
             messagebox.showinfo(
                 "Cleanup Complete",
                 f"Cleanup finished for {mountpoint}.\n\n"
                 f"Moved to Recovery: {format_bytes(result['deleted_bytes'])}\n"
-                f"Files skipped (in use/recent): {result['skipped_recent']}"
+                f"Files skipped (recent/other): {result['skipped_recent']}"
                 f"{permission_line}\n"
-                f"Folders scanned: {len(result['folders'])}"
+                f"Folders scanned: {len(result['folders'])}\n\n"
+                "Space is reclaimed when you empty Recovery."
             )
             if report_path and messagebox.askyesno(
-                "View Report?", "View the full list of deleted files now?"
+                "View Report?", "View the full list of moved files now?"
             ):
                 self.view_report_file(report_path)
             if self._active_page == "drives":
                 self.navigate_drives()
 
-        self.run_background(lambda: clean_drive_junk(mountpoint), finished)
+        def reset():
+            self._drive_clean_running = False
+            if button is not None:
+                button.config(state="normal")
+
+        self.run_background(do_clean, finished, on_error=self.make_error_handler(reset, "Cleanup Failed"))
 
     # =====================================================================
     # 4) Storage Analyzer
@@ -1613,7 +1856,7 @@ class PCOptimizer:
         self.fetch_drives_async(on_drives)
 
     def run_storage_analysis(self):
-        if getattr(self, "_storage_running", False):
+        if self._storage_running:
             return
 
         mount = self.storage_drive_var.get()
@@ -1645,7 +1888,13 @@ class PCOptimizer:
             except tk.TclError:
                 pass
 
-        self.run_background(do_analysis, finished)
+        def reset():
+            self._storage_running = False
+            if page_generation == self._page_generation:
+                self.storage_analyze_btn.config(state="normal")
+                self.storage_status_label.config(text="Scan failed.")
+
+        self.run_background(do_analysis, finished, on_error=self.make_error_handler(reset, "Scan Failed"))
 
     def render_storage_results(self, entries):
         for widget in self.storage_results_frame.winfo_children():
@@ -1653,14 +1902,14 @@ class PCOptimizer:
 
         if not entries:
             tk.Label(self.storage_results_frame, text="No accessible items found (or the folder is empty).",
-                      font=("Segoe UI", 11), fg="#d1d5db", bg=COLOR_BG).pack(anchor="w", pady=20)
+                     font=("Segoe UI", 11), fg="#d1d5db", bg=COLOR_BG).pack(anchor="w", pady=20)
             return
 
         max_size = max(size for _, size, _ in entries) or 1
 
         for name, size, is_dir in entries:
             row = tk.Frame(self.storage_results_frame, bg=COLOR_CARD,
-                            highlightbackground=COLOR_BORDER, highlightthickness=1)
+                           highlightbackground=COLOR_BORDER, highlightthickness=1)
             row.pack(fill="x", pady=4, ipady=6)
 
             top = tk.Frame(row, bg=COLOR_CARD)
@@ -1669,7 +1918,7 @@ class PCOptimizer:
             icon = "📁" if is_dir else "📄"
             tk.Label(top, text=f"{icon}  {name}", font=("Segoe UI", 11), fg="white", bg=COLOR_CARD).pack(side="left")
             tk.Label(top, text=format_bytes(size), font=("Segoe UI", 11, "bold"), fg=COLOR_MUTED,
-                      bg=COLOR_CARD).pack(side="right")
+                     bg=COLOR_CARD).pack(side="right")
 
             bar_bg = tk.Frame(row, bg="#334155", height=8)
             bar_bg.pack(fill="x", padx=15, pady=(0, 8))
@@ -1677,7 +1926,7 @@ class PCOptimizer:
             tk.Frame(bar_bg, bg=COLOR_ACCENT).place(relx=0, rely=0, relwidth=max(size / max_size, 0.01), relheight=1)
 
     # =====================================================================
-    # 5) Cleanup (categories with checkboxes, scan-before-cleanup)
+    # 5) Cleanup
     # =====================================================================
 
     def navigate_cleanup(self):
@@ -1688,9 +1937,10 @@ class PCOptimizer:
         intro.pack(fill="x", padx=35, pady=(0, 10))
         tk.Label(
             intro,
-            text=("Scan first to see exactly what's cleanable and how much space it would free, "
-                  "then pick which categories to clean. Files modified in the last "
-                  f"{self.config['min_age_minutes']} minutes are always skipped."),
+            text=("Scan first to see what's cleanable, then pick which categories to clean. "
+                  f"Files modified in the last {self.config['min_age_minutes']} minutes are always skipped. "
+                  "Cleaned files are MOVED to the Recovery page, so disk space is only reclaimed "
+                  "once you empty Recovery."),
             font=("Segoe UI", 10), fg="#d1d5db", bg=COLOR_BG, wraplength=800, justify="left"
         ).pack(anchor="w")
 
@@ -1701,7 +1951,7 @@ class PCOptimizer:
         self.cleanup_scan_btn.pack(side="left")
 
         self.cleanup_status_label = tk.Label(controls, text="", font=("Segoe UI", 10, "italic"),
-                                               fg=COLOR_MUTED, bg=COLOR_BG)
+                                             fg=COLOR_MUTED, bg=COLOR_BG)
         self.cleanup_status_label.pack(side="left", padx=15)
 
         self.cleanup_results_frame = tk.Frame(self.main, bg=COLOR_BG)
@@ -1716,7 +1966,7 @@ class PCOptimizer:
         self.category_sizes = {}
 
     def run_cleanup_scan(self):
-        if getattr(self, "_cleanup_running", False):
+        if self._cleanup_running:
             return
         self._cleanup_running = True
         self.cleanup_scan_btn.config(state="disabled")
@@ -1737,7 +1987,12 @@ class PCOptimizer:
             if self._active_page == "cleanup":
                 self.render_cleanup_checkboxes(results)
 
-        self.run_background(do_scan, finished)
+        def reset():
+            self._cleanup_running = False
+            self.cleanup_scan_btn.config(state="normal")
+            self.cleanup_status_label.config(text="")
+
+        self.run_background(do_scan, finished, on_error=self.make_error_handler(reset, "Scan Failed"))
 
     def render_cleanup_checkboxes(self, results):
         for widget in self.cleanup_results_frame.winfo_children():
@@ -1748,16 +2003,16 @@ class PCOptimizer:
         total = 0
 
         list_container = tk.Frame(self.cleanup_results_frame, bg=COLOR_CARD,
-                                    highlightbackground=COLOR_BORDER, highlightthickness=1)
+                                  highlightbackground=COLOR_BORDER, highlightthickness=1)
         list_container.pack(fill="both", expand=True)
 
         header_row = tk.Frame(list_container, bg=COLOR_CARD)
         header_row.pack(fill="x", padx=20, pady=(15, 5))
 
         self.make_button(header_row, "Select All", lambda: self.set_all_categories(True),
-                          bg="#334155", hover="#475569", font=("Segoe UI", 9), padx=10, pady=5).pack(side="left")
+                         bg="#334155", hover="#475569", font=("Segoe UI", 9), padx=10, pady=5).pack(side="left")
         self.make_button(header_row, "Select None", lambda: self.set_all_categories(False),
-                          bg="#334155", hover="#475569", font=("Segoe UI", 9), padx=10, pady=5).pack(
+                         bg="#334155", hover="#475569", font=("Segoe UI", 9), padx=10, pady=5).pack(
             side="left", padx=8
         )
 
@@ -1780,14 +2035,14 @@ class PCOptimizer:
             text_frame = tk.Frame(row, bg=COLOR_CARD)
             text_frame.pack(side="left", fill="x", expand=True, padx=(5, 0))
             tk.Label(text_frame, text=f"{cat['label']} — {format_bytes(size)} ({count} files)",
-                      font=("Segoe UI", 11, "bold"), fg="white", bg=COLOR_CARD).pack(anchor="w")
+                     font=("Segoe UI", 11, "bold"), fg="white", bg=COLOR_CARD).pack(anchor="w")
             tk.Label(text_frame, text=cat["description"], font=("Segoe UI", 9),
-                      fg=COLOR_MUTED, bg=COLOR_CARD).pack(anchor="w")
+                     fg=COLOR_MUTED, bg=COLOR_CARD).pack(anchor="w")
 
         footer = tk.Frame(list_container, bg=COLOR_CARD)
         footer.pack(fill="x", padx=20, pady=(10, 15))
         tk.Label(footer, text=f"Total cleanable: {format_bytes(total)}", font=("Segoe UI", 11, "bold"),
-                  fg="white", bg=COLOR_CARD).pack(side="left")
+                 fg="white", bg=COLOR_CARD).pack(side="left")
 
         self.cleanup_clean_btn = self.make_button(
             footer, "Clean Selected", self.run_cleanup_clean, bg=COLOR_GREEN, hover=COLOR_GREEN_HOVER
@@ -1802,7 +2057,7 @@ class PCOptimizer:
                 var.set(value)
 
     def run_cleanup_clean(self):
-        if getattr(self, "_cleanup_running", False):
+        if self._cleanup_running:
             return
 
         selected = [cat for cat in CLEANUP_CATEGORIES
@@ -1818,7 +2073,8 @@ class PCOptimizer:
         confirmed = messagebox.askyesno(
             "Confirm Cleanup",
             f"This will move files older than {self.config['min_age_minutes']} minutes into Recovery from:\n\n"
-            f"{labels}\n\nEstimated space freed: {format_bytes(total_est)}\n\nContinue?"
+            f"{labels}\n\nEstimated size: {format_bytes(total_est)}\n"
+            "(Space is only reclaimed once you empty Recovery.)\n\nContinue?"
         )
         if not confirmed:
             return
@@ -1852,24 +2108,29 @@ class PCOptimizer:
             combined, labels_done, report_path = result
             self._cleanup_running = False
             permission_line = (
-                f"\nFiles skipped (need administrator rights): {combined['skipped_permission']}"
+                f"\nFiles skipped (permission denied or in use): {combined['skipped_permission']}"
                 if combined["skipped_permission"] else ""
             )
             messagebox.showinfo(
                 "Cleanup Complete",
                 f"Cleanup finished.\n\nMoved to Recovery: {format_bytes(combined['deleted_bytes'])}\n"
-                f"Files skipped (in use/recent): {combined['skipped_recent']}"
+                f"Files skipped (recent/other): {combined['skipped_recent']}"
                 f"{permission_line}\n\nCategories cleaned:\n" +
-                "\n".join(f"• {l}" for l in labels_done)
+                "\n".join(f"• {l}" for l in labels_done) +
+                "\n\nSpace is reclaimed when you empty Recovery."
             )
             if report_path and messagebox.askyesno(
-                "View Report?", "View the full list of deleted files now?"
+                "View Report?", "View the full list of moved files now?"
             ):
                 self.view_report_file(report_path)
             if self._active_page == "cleanup":
                 self.navigate_cleanup()
 
-        self.run_background(do_clean, finished)
+        def reset():
+            self._cleanup_running = False
+            self.cleanup_clean_btn.config(state="normal")
+
+        self.run_background(do_clean, finished, on_error=self.make_error_handler(reset, "Cleanup Failed"))
 
     # =====================================================================
     # 6) Large File Finder
@@ -1890,7 +2151,7 @@ class PCOptimizer:
         tk.Label(controls, text="Drive:", font=("Segoe UI", 11), fg="white", bg=COLOR_BG).pack(side="left")
         self.largefile_drive_var = tk.StringVar(value="Loading...")
         drive_combo = ttk.Combobox(controls, textvariable=self.largefile_drive_var, values=["Loading..."],
-                                     state="disabled", width=25)
+                                   state="disabled", width=25)
         drive_combo.pack(side="left", padx=(8, 20))
 
         tk.Label(controls, text="Minimum size:", font=("Segoe UI", 11), fg="white", bg=COLOR_BG).pack(side="left")
@@ -1900,23 +2161,29 @@ class PCOptimizer:
         )
         self.largefile_size_var = tk.StringVar(value=default_label)
         ttk.Combobox(controls, textvariable=self.largefile_size_var,
-                      values=[lbl for lbl, _ in self.LARGE_FILE_SIZE_OPTIONS],
-                      state="readonly", width=12).pack(side="left", padx=8)
+                     values=[lbl for lbl, _ in self.LARGE_FILE_SIZE_OPTIONS],
+                     state="readonly", width=12).pack(side="left", padx=8)
 
         self.largefile_find_btn = self.make_button(controls, "Find Large Files", self.run_large_file_scan)
         self.largefile_find_btn.config(state="disabled")
-        self.largefile_find_btn.pack(side="left", padx=15)
+        self.largefile_find_btn.pack(side="left", padx=(15, 5))
+
+        self.largefile_cancel_btn = self.make_button(
+            controls, "Cancel", self.cancel_large_file_scan, bg="#334155", hover="#475569"
+        )
+        self.largefile_cancel_btn.config(state="disabled")
+        self.largefile_cancel_btn.pack(side="left", padx=5)
 
         self.largefile_status_label = tk.Label(controls, text="", font=("Segoe UI", 10, "italic"),
-                                                 fg=COLOR_MUTED, bg=COLOR_BG)
-        self.largefile_status_label.pack(side="left")
+                                               fg=COLOR_MUTED, bg=COLOR_BG)
+        self.largefile_status_label.pack(side="left", padx=10)
         self.start_loading(self.largefile_status_label, "Loading drives")
 
         self.largefile_results_frame = self.make_scrollable(self.main)
         tk.Label(
             self.largefile_results_frame,
             text="Pick a drive and size threshold, then click Find Large Files. "
-                 "Scanning a full drive can take a while.",
+                 "Scanning a full drive can take a while -- you can cancel at any time.",
             font=("Segoe UI", 11), fg="#d1d5db", bg=COLOR_BG, wraplength=700, justify="left"
         ).pack(anchor="w", pady=20)
 
@@ -1925,7 +2192,7 @@ class PCOptimizer:
 
         def on_drives(drives):
             if self._active_page != "largefiles" or my_request_id != self._largefile_request_id:
-                return  # navigated away, or a newer Large File Finder load superseded this one
+                return
 
             self.stop_loading()
             try:
@@ -1935,12 +2202,20 @@ class PCOptimizer:
                 self.largefile_drive_var.set(mountpoints[0])
                 self.largefile_find_btn.config(state="normal")
             except tk.TclError:
-                return  # widgets from this page instance are already gone
+                return
 
         self.fetch_drives_async(on_drives)
 
+    def cancel_large_file_scan(self):
+        if self._largefile_cancel is not None:
+            self._largefile_cancel.set()
+        try:
+            self.largefile_cancel_btn.config(state="disabled")
+        except tk.TclError:
+            pass
+
     def run_large_file_scan(self):
-        if getattr(self, "_largefile_running", False):
+        if self._largefile_running:
             return
 
         mount = self.largefile_drive_var.get()
@@ -1948,22 +2223,42 @@ class PCOptimizer:
         min_mb = dict(self.LARGE_FILE_SIZE_OPTIONS).get(size_label, 100)
         min_bytes = min_mb * 1024 * 1024
 
+        cancel_event = threading.Event()
+        self._largefile_cancel = cancel_event
         self._largefile_running = True
+        page_generation = self._page_generation
         self.largefile_find_btn.config(state="disabled")
+        self.largefile_cancel_btn.config(state="normal")
         self.start_loading(self.largefile_status_label, "Scanning")
 
         def finished(results):
             self._largefile_running = False
             self.stop_loading()
+            if page_generation != self._page_generation:
+                return
             try:
                 self.largefile_find_btn.config(state="normal")
-                self.largefile_status_label.config(text="")
+                self.largefile_cancel_btn.config(state="disabled")
+                self.largefile_status_label.config(
+                    text="Cancelled -- showing partial results." if cancel_event.is_set() else ""
+                )
             except tk.TclError:
                 pass
             if self._active_page == "largefiles":
                 self.render_large_file_results(results)
 
-        self.run_background(lambda: find_large_files(mount, min_bytes, max_results=100), finished)
+        def reset():
+            self._largefile_running = False
+            if page_generation == self._page_generation:
+                self.largefile_find_btn.config(state="normal")
+                self.largefile_cancel_btn.config(state="disabled")
+                self.largefile_status_label.config(text="")
+
+        self.run_background(
+            lambda: find_large_files(mount, min_bytes, max_results=100, cancel_event=cancel_event),
+            finished,
+            on_error=self.make_error_handler(reset, "Scan Failed")
+        )
 
     def render_large_file_results(self, results):
         for widget in self.largefile_results_frame.winfo_children():
@@ -1971,27 +2266,35 @@ class PCOptimizer:
 
         if not results:
             tk.Label(self.largefile_results_frame, text="No files found at or above that size.",
-                      font=("Segoe UI", 11), fg="#d1d5db", bg=COLOR_BG).pack(anchor="w", pady=20)
+                     font=("Segoe UI", 11), fg="#d1d5db", bg=COLOR_BG).pack(anchor="w", pady=20)
             return
 
         for path, size in results:
             row = tk.Frame(self.largefile_results_frame, bg=COLOR_CARD,
-                            highlightbackground=COLOR_BORDER, highlightthickness=1)
+                           highlightbackground=COLOR_BORDER, highlightthickness=1)
             row.pack(fill="x", pady=3, ipady=4)
 
             tk.Label(row, text=path, font=("Segoe UI", 10), fg="white", bg=COLOR_CARD,
-                      anchor="w").pack(side="left", padx=15, fill="x", expand=True)
+                     anchor="w").pack(side="left", padx=15, fill="x", expand=True)
             tk.Label(row, text=format_bytes(size), font=("Segoe UI", 10, "bold"), fg=COLOR_MUTED,
-                      bg=COLOR_CARD).pack(side="left", padx=10)
+                     bg=COLOR_CARD).pack(side="left", padx=10)
+
+            if is_protected_path(path):
+                tk.Label(row, text="System file", font=("Segoe UI", 9, "italic"),
+                         fg=COLOR_WARNING, bg=COLOR_CARD).pack(side="right", padx=15)
+                continue
 
             del_btn = self.make_button(
-                row, "Delete", None, bg=COLOR_DANGER, hover=COLOR_DANGER_HOVER,
+                row, "Move to Recovery", None, bg=COLOR_DANGER, hover=COLOR_DANGER_HOVER,
                 font=("Segoe UI", 9, "bold"), padx=10, pady=4
             )
             del_btn.config(command=lambda p=path, r=row: self.delete_large_file(p, r))
             del_btn.pack(side="right", padx=15)
 
     def delete_large_file(self, path, row_widget):
+        if is_protected_path(path):
+            messagebox.showerror("Protected File", "This looks like a system or program file and won't be moved.")
+            return
         confirmed = messagebox.askyesno(
             "Move To Recovery",
             f"Move this file to PC Optimizer Recovery?\n\n{path}\n\nYou can restore it later."
@@ -2016,7 +2319,6 @@ class PCOptimizer:
             "Moved To Recovery",
             f"Moved to Recovery:\n\n{path}\n\nSize: {format_bytes(record.get('size', 0))}"
         )
-
 
     # =====================================================================
     # 7) Process Viewer
@@ -2063,47 +2365,61 @@ class PCOptimizer:
         self.tick_processes()
 
     def on_process_select(self, event):
-        selected = self.process_tree.selection()
-        self.process_end_btn.config(state="normal" if selected else "disabled")
+        try:
+            selected = self.process_tree.selection()
+            self.process_end_btn.config(state="normal" if selected else "disabled")
+        except tk.TclError:
+            pass
 
     def tick_processes(self):
         if self._active_page != "processes":
             return
 
-        if getattr(self, "_processes_tick_pending", False):
-            self.root.after(2000, self.tick_processes)
+        generation = self._page_generation
+
+        if self._processes_tick_pending:
+            self.schedule("processes", 2000, self.tick_processes)
             return
         self._processes_tick_pending = True
 
         def collect_rows():
-            # Background thread: only touches psutil, never Tk.
             return refresh_process_rows(self._proc_cache)
 
         def apply_rows(rows):
-            self._processes_tick_pending = False
-            if self._active_page != "processes":
+            if generation != self._page_generation:
                 return
+            self._processes_tick_pending = False
 
             try:
-                selected_pid = None
-                selection = self.process_tree.selection()
-                if selection:
-                    selected_pid = selection[0]
+                tree = self.process_tree
+                existing = set(tree.get_children())
+                wanted = {str(pid) for pid, _, _, _ in rows}
 
-                for item in self.process_tree.get_children():
-                    self.process_tree.delete(item)
+                # Update rows in place (keeps scroll position and selection
+                # instead of rebuilding the whole table every tick).
+                for iid in existing - wanted:
+                    tree.delete(iid)
 
-                for pid, name, cpu, mem in rows:
-                    self.process_tree.insert("", "end", iid=str(pid), values=(name, pid, f"{cpu:.1f}", f"{mem:.1f}"))
-
-                if selected_pid and self.process_tree.exists(selected_pid):
-                    self.process_tree.selection_set(selected_pid)
+                for idx, (pid, name, cpu, mem) in enumerate(rows):
+                    iid = str(pid)
+                    values = (name, pid, f"{cpu:.1f}", f"{mem:.1f}")
+                    if iid in existing:
+                        tree.item(iid, values=values)
+                    else:
+                        tree.insert("", idx, iid=iid, values=values)
+                    tree.move(iid, "", idx)
             except tk.TclError:
-                pass  # process viewer widgets were torn down mid-update; harmless
+                pass
 
-            self.root.after(2000, self.tick_processes)
+            self.schedule("processes", 2000, self.tick_processes)
 
-        self.run_background(collect_rows, apply_rows)
+        def failed(exc):
+            if generation != self._page_generation:
+                return
+            self._processes_tick_pending = False
+            self.schedule("processes", 2000, self.tick_processes)
+
+        self.run_background(collect_rows, apply_rows, on_error=failed)
 
     def end_selected_process(self):
         selection = self.process_tree.selection()
@@ -2129,6 +2445,7 @@ class PCOptimizer:
 
     def navigate_startup(self):
         self.set_page("startup")
+        generation = self._page_generation
         header = self.create_header("Startup Apps")
 
         if winreg is None:
@@ -2175,7 +2492,7 @@ class PCOptimizer:
         loading_row = self.startup_tree.insert("", "end", values=("Loading...", "", ""))
 
         def finished(items):
-            if self._active_page != "startup":
+            if generation != self._page_generation:
                 return
             try:
                 self.startup_tree.delete(loading_row)
@@ -2183,19 +2500,34 @@ class PCOptimizer:
                 for i, item in enumerate(items):
                     self.startup_tree.insert("", "end", iid=str(i), values=(item["name"], item["location"], item["command"]))
             except tk.TclError:
-                pass  # startup page was closed mid-load; harmless
+                pass
 
-        self.run_background(get_startup_items, finished)
+        def failed(exc):
+            if generation != self._page_generation:
+                return
+            try:
+                self.startup_tree.delete(loading_row)
+                self.startup_tree.insert("", "end", values=("Could not read startup items", str(exc), ""))
+            except tk.TclError:
+                pass
+
+        self.run_background(get_startup_items, finished, on_error=failed)
 
     def on_startup_select(self, event):
-        selected = self.startup_tree.selection()
-        self.startup_remove_btn.config(state="normal" if selected else "disabled")
+        try:
+            selected = self.startup_tree.selection()
+            self.startup_remove_btn.config(state="normal" if selected else "disabled")
+        except tk.TclError:
+            pass
 
     def remove_selected_startup_item(self):
         selection = self.startup_tree.selection()
         if not selection:
             return
-        item = self._startup_items[int(selection[0])]
+        try:
+            item = self._startup_items[int(selection[0])]
+        except (ValueError, IndexError):
+            return
 
         confirmed = messagebox.askyesno(
             "Remove Startup Item",
@@ -2219,14 +2551,14 @@ class PCOptimizer:
         self.set_page("history")
         header = self.create_header("Cleanup History")
         self.make_button(header, "Clear History", self.clear_history_action,
-                          bg=COLOR_DANGER, hover=COLOR_DANGER_HOVER).pack(side="right")
+                         bg=COLOR_DANGER, hover=COLOR_DANGER_HOVER).pack(side="right")
 
         history = load_history()
         list_frame = self.make_scrollable(self.main)
 
         if not history:
             tk.Label(list_frame, text="No cleanup history yet.", font=("Segoe UI", 11),
-                      fg="#d1d5db", bg=COLOR_BG).pack(anchor="w", pady=20)
+                     fg="#d1d5db", bg=COLOR_BG).pack(anchor="w", pady=20)
             return
 
         for record in history:
@@ -2242,22 +2574,22 @@ class PCOptimizer:
             top = tk.Frame(row, bg=COLOR_CARD)
             top.pack(fill="x", padx=18, pady=(6, 2))
             tk.Label(top, text=date_text, font=("Segoe UI", 11, "bold"), fg="white", bg=COLOR_CARD).pack(side="left")
-            tk.Label(top, text=format_bytes(record.get("freed_bytes", 0)), font=("Segoe UI", 11, "bold"),
-                      fg=COLOR_SUCCESS, bg=COLOR_CARD).pack(side="right")
+            tk.Label(top, text=f"{format_bytes(record.get('freed_bytes', 0))} moved to Recovery",
+                     font=("Segoe UI", 11, "bold"), fg=COLOR_SUCCESS, bg=COLOR_CARD).pack(side="right")
 
             categories = ", ".join(record.get("categories", [])) or "Unknown"
             tk.Label(row, text=f"Cleaned: {categories}", font=("Segoe UI", 9), fg=COLOR_MUTED,
-                      bg=COLOR_CARD, wraplength=800, justify="left").pack(anchor="w", padx=18)
+                     bg=COLOR_CARD, wraplength=800, justify="left").pack(anchor="w", padx=18)
 
             skipped = record.get("skipped_files", 0)
             if skipped:
-                tk.Label(row, text=f"{skipped} file(s) skipped (in use or too recent)",
-                          font=("Segoe UI", 9), fg=COLOR_MUTED, bg=COLOR_CARD).pack(anchor="w", padx=18)
+                tk.Label(row, text=f"{skipped} file(s) skipped (too recent or other)",
+                         font=("Segoe UI", 9), fg=COLOR_MUTED, bg=COLOR_CARD).pack(anchor="w", padx=18)
 
             skipped_permission = record.get("skipped_permission", 0)
             if skipped_permission:
                 tk.Label(
-                    row, text=f"{skipped_permission} file(s) skipped -- need administrator rights",
+                    row, text=f"{skipped_permission} file(s) skipped -- permission denied or in use",
                     font=("Segoe UI", 9), fg=COLOR_WARNING, bg=COLOR_CARD
                 ).pack(anchor="w", padx=18)
 
@@ -2279,60 +2611,99 @@ class PCOptimizer:
     # 10) Recovery
     # =====================================================================
 
+    RECOVERY_PAGE_SIZE = 100
+
     def navigate_recovery(self):
         self.set_page("recovery")
         page_generation = self._page_generation
         header = self.create_header("Recovery")
 
-        items = reconcile_recovery_index(load_recovery_index())
-        valid = [x for x in items if x.get("recovery_path") and os.path.isfile(x.get("recovery_path"))]
-        if len(valid) != len(items):
-            save_recovery_index(valid)
-        items = valid
+        items = load_reconciled_recovery()
 
-        self.make_button(header, "Restore All", self.restore_all_recovery, bg=COLOR_GREEN, hover=COLOR_GREEN_HOVER).pack(side="right", padx=(10, 0))
-        self.make_button(header, "Permanently Delete All", self.delete_all_recovery, bg=COLOR_DANGER, hover=COLOR_DANGER_HOVER).pack(side="right")
+        self.make_button(header, "Restore All", self.restore_all_recovery,
+                         bg=COLOR_GREEN, hover=COLOR_GREEN_HOVER).pack(side="right", padx=(10, 0))
+        self.make_button(header, "Permanently Delete All", self.delete_all_recovery,
+                         bg=COLOR_DANGER, hover=COLOR_DANGER_HOVER).pack(side="right")
 
         total = sum(x.get("size", 0) for x in items)
+        unknown = sum(1 for x in items if not has_valid_original(x))
         tk.Label(self.main, text=f"{len(items)} recovered file(s)  •  {format_bytes(total)}",
                  font=("Segoe UI", 11, "bold"), fg="white", bg=COLOR_BG).pack(anchor="w", padx=35)
-        tk.Label(self.main, text="Inspect files here before permanently deleting them. You can restore any file to its original location.",
-                 font=("Segoe UI", 9), fg=COLOR_MUTED, bg=COLOR_BG, wraplength=850, justify="left").pack(anchor="w", padx=35, pady=(5, 10))
+        info_text = ("Inspect files here before permanently deleting them. Emptying Recovery is what "
+                     "actually reclaims disk space.")
+        if unknown:
+            info_text += (f"\n{unknown} file(s) have an unknown original location and can't be restored "
+                          "-- they can only be deleted.")
+        tk.Label(self.main, text=info_text, font=("Segoe UI", 9), fg=COLOR_MUTED, bg=COLOR_BG,
+                 wraplength=850, justify="left").pack(anchor="w", padx=35, pady=(5, 10))
 
         frame = self.make_scrollable(self.main)
         if not items:
-            tk.Label(frame, text="Recovery is empty.", font=("Segoe UI", 12), fg="#d1d5db", bg=COLOR_BG).pack(anchor="w", pady=20)
+            tk.Label(frame, text="Recovery is empty.", font=("Segoe UI", 12), fg="#d1d5db",
+                     bg=COLOR_BG).pack(anchor="w", pady=20)
             return
 
-        def render_batch(index=0):
-            # If the user navigated away, stop creating old-page widgets.
-            # The files themselves remain untouched in Recovery.
+        def render_from(start):
             if self._active_page != "recovery" or self._page_generation != page_generation:
                 return
+            end = min(start + self.RECOVERY_PAGE_SIZE, len(items))
+            for item in items[start:end]:
+                self.create_recovery_row(frame, item)
 
-            batch_size = 20
-            end_index = min(index + batch_size, len(items))
+            if end < len(items):
+                more = tk.Frame(frame, bg=COLOR_BG)
+                more.pack(fill="x", pady=10)
 
-            for item in items[index:end_index]:
-                row = tk.Frame(frame, bg=COLOR_CARD, highlightbackground=COLOR_BORDER, highlightthickness=1)
-                row.pack(fill="x", pady=5, ipady=8)
-                info = tk.Frame(row, bg=COLOR_CARD)
-                info.pack(side="left", fill="x", expand=True, padx=18, pady=7)
-                tk.Label(info, text=item.get("name", "Unknown file"), font=("Segoe UI", 11, "bold"), fg="white", bg=COLOR_CARD).pack(anchor="w")
-                tk.Label(info, text=f"Original: {item.get('original_path', 'Unknown')}", font=("Segoe UI", 9), fg=COLOR_MUTED, bg=COLOR_CARD, wraplength=560, justify="left").pack(anchor="w", pady=(3, 0))
-                tk.Label(info, text=f"Size: {format_bytes(item.get('size', 0))}  •  Moved: {item.get('moved_at', 'Unknown')}", font=("Segoe UI", 9), fg=COLOR_MUTED, bg=COLOR_CARD).pack(anchor="w", pady=(3, 0))
-                buttons = tk.Frame(row, bg=COLOR_CARD)
-                buttons.pack(side="right", padx=15)
-                self.make_button(buttons, "Restore", lambda i=item: self.restore_single_recovery(i), bg=COLOR_GREEN, hover=COLOR_GREEN_HOVER, font=("Segoe UI", 9, "bold"), padx=10, pady=5).pack(side="left", padx=(0, 8))
-                self.make_button(buttons, "Permanently Delete", lambda i=item: self.delete_single_recovery(i), bg=COLOR_DANGER, hover=COLOR_DANGER_HOVER, font=("Segoe UI", 9, "bold"), padx=10, pady=5).pack(side="left")
+                def load_more(e=end, m=more):
+                    m.destroy()
+                    render_from(e)
 
-            if end_index < len(items):
-                self.root.after(1, lambda n=end_index: render_batch(n))
+                self.make_button(
+                    more, f"Show more ({len(items) - end} remaining)", load_more,
+                    bg="#334155", hover="#475569", font=("Segoe UI", 9, "bold"), padx=14, pady=6
+                ).pack()
 
-        render_batch()
+        render_from(0)
+
+    def create_recovery_row(self, parent, item):
+        row = tk.Frame(parent, bg=COLOR_CARD, highlightbackground=COLOR_BORDER, highlightthickness=1)
+        row.pack(fill="x", pady=5)
+        row.columnconfigure(0, weight=1)
+        row.columnconfigure(1, weight=0)
+
+        info = tk.Frame(row, bg=COLOR_CARD)
+        info.grid(row=0, column=0, sticky="w", padx=18, pady=10)
+        tk.Label(info, text=item.get("name", "Unknown file"), font=("Segoe UI", 11, "bold"),
+                 fg="white", bg=COLOR_CARD, wraplength=480, justify="left").pack(anchor="w")
+        tk.Label(info, text=f"Original: {item.get('original_path', 'Unknown')}", font=("Segoe UI", 9),
+                 fg=COLOR_MUTED, bg=COLOR_CARD, wraplength=480, justify="left").pack(anchor="w", pady=(3, 0))
+        tk.Label(info, text=f"Size: {format_bytes(item.get('size', 0))}  •  Moved: {item.get('moved_at', 'Unknown')}",
+                 font=("Segoe UI", 9), fg=COLOR_MUTED, bg=COLOR_CARD).pack(anchor="w", pady=(3, 0))
+
+        buttons = tk.Frame(row, bg=COLOR_CARD)
+        buttons.grid(row=0, column=1, sticky="e", padx=15, pady=10)
+
+        restore_btn = self.make_button(
+            buttons, "Restore", lambda i=item: self.restore_single_recovery(i),
+            bg=COLOR_GREEN, hover=COLOR_GREEN_HOVER, font=("Segoe UI", 9, "bold"), padx=10, pady=5
+        )
+        restore_btn.config(width=9)
+        restore_btn.pack(side="left", padx=(0, 8))
+        if not has_valid_original(item):
+            restore_btn.config(state="disabled", bg="#475569")
+
+        delete_btn = self.make_button(
+            buttons, "Permanently Delete", lambda i=item: self.delete_single_recovery(i),
+            bg=COLOR_DANGER, hover=COLOR_DANGER_HOVER, font=("Segoe UI", 9, "bold"), padx=10, pady=5
+        )
+        delete_btn.config(width=18)
+        delete_btn.pack(side="left")
 
     def restore_single_recovery(self, item):
         path = item.get("original_path", "Unknown")
+        if not has_valid_original(item):
+            messagebox.showerror("Can't Restore", "The original location of this file is unknown.")
+            return
         if not messagebox.askyesno("Restore File", f"Restore this file?\n\n{path}"):
             return
         ok, error = restore_recovery_item(item)
@@ -2343,8 +2714,9 @@ class PCOptimizer:
             messagebox.showerror("Restore Failed", error or "Could not restore file.")
 
     def delete_single_recovery(self, item):
-        path = item.get("original_path", "Unknown")
-        if not messagebox.askyesno("Permanently Delete", f"Permanently delete this recovered file?\n\n{path}\n\nThis cannot be undone."):
+        label = item.get("name", "this file")
+        if not messagebox.askyesno("Permanently Delete",
+                                   f"Permanently delete this recovered file?\n\n{label}\n\nThis cannot be undone."):
             return
         ok, error = permanently_delete_recovery_item(item)
         if ok:
@@ -2353,41 +2725,67 @@ class PCOptimizer:
             messagebox.showerror("Delete Failed", error or "Could not delete file.")
 
     def restore_all_recovery(self):
-        items = load_recovery_index()
+        if self._recovery_busy:
+            return
+        items = load_reconciled_recovery()
         if not items:
             messagebox.showinfo("Recovery Empty", "There are no files to restore.")
             return
-        if not messagebox.askyesno("Restore All", f"Restore all {len(items)} recovered file(s)?"):
+        restorable = [x for x in items if has_valid_original(x)]
+        unknown = len(items) - len(restorable)
+        if not restorable:
+            messagebox.showinfo("Nothing To Restore",
+                                "None of these files have a known original location, so none can be restored.")
             return
-        restored = 0
-        failed = 0
-        for item in list(items):
-            ok, _ = restore_recovery_item(item)
-            if ok:
-                restored += 1
-            else:
-                failed += 1
-        messagebox.showinfo("Restore Complete", f"Restored: {restored}\nFailed: {failed}")
-        self.navigate_recovery()
+        extra = f"\n\n{unknown} file(s) with an unknown original location will be skipped." if unknown else ""
+        if not messagebox.askyesno("Restore All", f"Restore {len(restorable)} recovered file(s)?{extra}"):
+            return
+
+        self._recovery_busy = True
+
+        def finished(result):
+            self._recovery_busy = False
+            restored, failed = result
+            messagebox.showinfo("Restore Complete", f"Restored: {restored}\nFailed: {failed}\nSkipped (unknown location): {unknown}")
+            if self._active_page == "recovery":
+                self.navigate_recovery()
+
+        def reset():
+            self._recovery_busy = False
+
+        self.run_background(lambda: restore_recovery_items(restorable), finished,
+                            on_error=self.make_error_handler(reset, "Restore Failed"))
 
     def delete_all_recovery(self):
-        items = load_recovery_index()
+        if self._recovery_busy:
+            return
+        items = load_reconciled_recovery()
         if not items:
             messagebox.showinfo("Recovery Empty", "There are no files to permanently delete.")
             return
         total = sum(x.get("size", 0) for x in items)
-        if not messagebox.askyesno("Permanently Delete All", f"Permanently delete all {len(items)} recovered file(s)?\n\nTotal: {format_bytes(total)}\n\nThis cannot be undone."):
+        if not messagebox.askyesno(
+            "Permanently Delete All",
+            f"Permanently delete all {len(items)} recovered file(s)?\n\nTotal: {format_bytes(total)}\n\n"
+            "This cannot be undone."
+        ):
             return
-        deleted = 0
-        failed = 0
-        for item in list(items):
-            ok, _ = permanently_delete_recovery_item(item)
-            if ok:
-                deleted += 1
-            else:
-                failed += 1
-        messagebox.showinfo("Recovery Cleanup Complete", f"Permanently deleted: {deleted}\nFailed: {failed}")
-        self.navigate_recovery()
+
+        self._recovery_busy = True
+
+        def finished(result):
+            self._recovery_busy = False
+            deleted, failed = result
+            messagebox.showinfo("Recovery Cleanup Complete",
+                                f"Permanently deleted: {deleted}\nFailed: {failed}")
+            if self._active_page == "recovery":
+                self.navigate_recovery()
+
+        def reset():
+            self._recovery_busy = False
+
+        self.run_background(lambda: permanently_delete_recovery_items(items), finished,
+                            on_error=self.make_error_handler(reset, "Delete Failed"))
 
     # =====================================================================
     # 11) Settings
@@ -2433,9 +2831,9 @@ class PCOptimizer:
         footer = tk.Frame(form, bg=COLOR_CARD)
         footer.pack(fill="x", padx=25, pady=(15, 5))
         self.make_button(footer, "Save Settings", self.save_settings_action, bg=COLOR_GREEN,
-                          hover=COLOR_GREEN_HOVER).pack(side="left")
+                         hover=COLOR_GREEN_HOVER).pack(side="left")
         self.settings_status_label = tk.Label(footer, text="", font=("Segoe UI", 10, "italic"),
-                                                fg=COLOR_SUCCESS, bg=COLOR_CARD)
+                                              fg=COLOR_SUCCESS, bg=COLOR_CARD)
         self.settings_status_label.pack(side="left", padx=15)
 
     def _label_for(self, options, value, fallback):
@@ -2452,7 +2850,7 @@ class PCOptimizer:
         text_frame.pack(side="left", fill="x", expand=True)
         tk.Label(text_frame, text=title, font=("Segoe UI", 11, "bold"), fg="white", bg=COLOR_CARD).pack(anchor="w")
         tk.Label(text_frame, text=description, font=("Segoe UI", 9), fg=COLOR_MUTED, bg=COLOR_CARD,
-                  wraplength=550, justify="left").pack(anchor="w")
+                 wraplength=550, justify="left").pack(anchor="w")
 
         ttk.Combobox(row, textvariable=var, values=options, state="readonly", width=15).pack(side="right")
 
@@ -2468,7 +2866,7 @@ class PCOptimizer:
         save_config(self.config)
 
         self.settings_status_label.config(text="Settings saved.")
-        self.root.after(2000, lambda: self._clear_settings_status())
+        self.root.after(2000, self._clear_settings_status)
 
     def _clear_settings_status(self):
         try:
